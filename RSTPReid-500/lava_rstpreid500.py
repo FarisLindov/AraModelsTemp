@@ -108,6 +108,24 @@ def latency(log, csv, tag):
     Path(csv).write_text('run,hw_ms,app_ms\n' + ''.join(f'{a},{b:.6f},{c:.6f}\n' for a, b, c in rows))
 
 
+def params(log):
+    # Parse nnapp "PARAM input=" / "PARAM output=" lines and print shell assignments.
+    # Ara convention: q = real / qn + offset, real = (q - offset) * qn. Missing offset -> 0.
+    txt = Path(log).read_text(errors='replace')
+    for kind in ('input', 'output'):
+        m = re.search(rf'^PARAM {kind}=0 .*$', txt, re.M)
+        assert m, f'no PARAM {kind} line in {log}'
+        kv = dict(re.findall(r'(\w+)=(\S*)', m.group(0)))
+        signed = kv.get('signed', '1') == '1'
+        isfloat = kv.get('float', '0') == '1'
+        dtype = 'float32' if isfloat else ('int8' if signed else 'uint8')
+        tag = kind.upper()
+        print(f'{tag}_DTYPE={dtype}')
+        print(f'{tag}_QSCALE={float(kv.get("qn", "1"))}')
+        print(f'{tag}_ZERO_POINT={int(float(kv.get("offset", "0") or 0))}')
+        print(f'{tag}_SIZE={int(kv.get("size", "0"))}')
+
+
 def l2n(x):
     return x / np.maximum(np.linalg.norm(x, axis=-1, keepdims=True), 1e-12)
 
@@ -127,17 +145,24 @@ def metrics(ds, vdir, tdir, report, vdt, vqs, vzp, tdt, tqs, tzp):
     pids = {p: k for k, p in enumerate(sorted({i['pid'] for i in gt['images']}))}
     img_pid = np.array([pids[i['pid']] for i in gt['images']])
     q_pid = np.array([pids[c['pid']] for c in gt['captions']])
-    G = l2n(np.stack([dequant((Path(vdir) / f'embedding_{k:04d}.bin').read_bytes(), vdt, vqs, vzp)
-                      for k in range(len(img_pid))]))
+    Gr, Tr = np.load(ds / 'ref' / 'vision_fp32.npy'), np.load(ds / 'ref' / 'text_fp32.npy')
+    vraw = [(Path(vdir) / f'embedding_{k:04d}.bin').read_bytes() for k in range(len(img_pid))]
+    traw = [(Path(tdir) / f'embedding_{k:04d}.bin').read_bytes() for k in range(len(q_pid))]
     Wp = np.fromfile(ds / 'text' / 'text_projection_weight.f32', np.float32).reshape(D, D)
     b = np.fromfile(ds / 'text' / 'text_projection_bias.f32', np.float32)
     eot = np.load(ds / 'text' / 'eot_index.npy')
-    T = []
-    for k in range(len(q_pid)):
-        h = dequant((Path(tdir) / f'embedding_{k:04d}.bin').read_bytes(), tdt, tqs, tzp).reshape(L, D)
-        T.append(Wp @ h[eot[k]] + b)
-    T = l2n(np.stack(T))
-    Gr, Tr = np.load(ds / 'ref' / 'vision_fp32.npy'), np.load(ds / 'ref' / 'text_fp32.npy')
+
+    def vis(zp):
+        return l2n(np.stack([dequant(r, vdt, vqs, zp) for r in vraw]))
+
+    def txt_(zp):
+        return l2n(np.stack([Wp @ dequant(r, tdt, tqs, zp).reshape(L, D)[eot[k]] + b
+                             for k, r in enumerate(traw)]))
+
+    # The sign convention of "offset" is not documented; pick the one that best matches fp32.
+    G, vzp = max(((vis(z), z) for z in {vzp, -vzp}), key=lambda t: float((t[0] * Gr).sum(1).mean()))
+    T, tzp = max(((txt_(z), z) for z in {tzp, -tzp}), key=lambda t: float((t[0] * Tr).sum(1).mean()))
+    print(f'using vision zero point {vzp}, text zero point {tzp}')
     cv, ct = (G * Gr).sum(1), (T * Tr).sum(1)
     out = []
     for tag, r in (('ara', evaluate(T @ G.T, img_pid, q_pid)),
@@ -145,7 +170,9 @@ def metrics(ds, vdir, tdir, report, vdt, vqs, vzp, tdt, tqs, tzp):
                    ('fp32_text_ara_vision_swap', evaluate(T @ Gr.T, img_pid, q_pid)),
                    ('fp32_onnx_ref', evaluate(Tr @ Gr.T, img_pid, q_pid))):
         out += [f'{tag}_{k}={v:.4f}' for k, v in r.items()]
-    out += [f'images={len(img_pid)}', f'queries={len(q_pid)}', f'ids={len(pids)}',
+    out += [f'vision_out_scale={vqs}', f'vision_out_zero_point={vzp}',
+            f'text_out_scale={tqs}', f'text_out_zero_point={tzp}',
+            f'images={len(img_pid)}', f'queries={len(q_pid)}', f'ids={len(pids)}',
             f'cos_vision_mean={cv.mean():.5f}', f'cos_vision_min={cv.min():.5f}',
             f'cos_text_mean={ct.mean():.5f}', f'cos_text_min={ct.min():.5f}']
     txt = '\n'.join(out) + '\n'
@@ -157,6 +184,8 @@ if __name__ == '__main__':
     cmd, a = sys.argv[1], sys.argv[2:]
     if cmd in ('prep-vision', 'prep-text'):
         (prep_vision if cmd == 'prep-vision' else prep_text)(a[0], a[1], a[2], float(a[3]), int(a[4]))
+    elif cmd == 'params':
+        params(a[0])
     elif cmd == 'decode':
         decode(*a)
     elif cmd == 'latency':
