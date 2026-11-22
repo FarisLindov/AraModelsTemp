@@ -114,6 +114,46 @@ def evaluate(S, ip, qp):
     return r
 
 
+def text_diag(ds, traw, tdt, tqs, tzp, L, off, eot, Wp, b, Tr):
+    # Diagnostics for the text DVM output. Compares the decoded hidden states with the
+    # fp32 ONNX hidden states (ref/text_hidden_fp32.npy, [N,77,512]) to separate
+    # quantization error from wrong layout, wrong scale or wrong readout row.
+    print('---- TEXT DIAG ----')
+    bpe = {'int8': 1, 'uint8': 1, 'int16': 2}.get(tdt, 4)
+    print(f'text dtype={tdt} qscale={tqs} zp={tzp} L={L} bytes/output={len(traw[0])} expected={L * D * bpe}')
+    if tdt in DT:
+        raw0 = np.frombuffer(traw[0], DT[tdt][0]).astype(np.int64)
+        lim = float(np.isin(raw0, [DT[tdt][1], DT[tdt][2]]).mean())
+        print(f'raw[0] min {raw0.min()} max {raw0.max()} mean {raw0.mean():.2f} frac_at_limits {lim:.4f}')
+    f = Path(ds) / 'ref' / 'text_hidden_fp32.npy'
+    if not f.exists():
+        print('no ref/text_hidden_fp32.npy, skipping hidden-state diag')
+        return
+    Hr = np.load(f).astype(np.float32)[:, off:]
+    n = min(len(traw), len(Hr))
+    H = np.stack([dequant(r, tdt, tqs, tzp).reshape(L, D) for r in traw[:n]])
+    Hr = Hr[:n]
+
+    def cos(a, c):
+        return float((l2n(a) * l2n(c)).sum(-1).mean())
+
+    idx = np.arange(n)
+    rows = np.array([eot[k] - off for k in range(n)])
+    hre = Hr[idx, rows]
+    print(f'hidden cos: all tokens {cos(H, Hr):.4f}  eot row {cos(H[idx, rows], hre):.4f}  row0 {cos(H[:, 0], Hr[:, 0]):.4f}')
+    print(f'hidden rms ratio ara/fp32 {float(np.sqrt((H ** 2).mean() / (Hr ** 2).mean())):.4f}')
+    Ht = np.stack([dequant(r, tdt, tqs, tzp).reshape(D, L).T for r in traw[:n]])
+    print(f'hidden cos if output is [512,L]: {cos(Ht, Hr):.4f}')
+    sim = np.einsum('nld,nd->nl', l2n(H), l2n(hre))
+    best = sim.argmax(1)
+    print(f'best row for fp32 eot: {best[:10].tolist()} expected {rows[:10].tolist()} best cos {float(sim.max(1).mean()):.4f}')
+    per_tok = (l2n(H) * l2n(Hr)).sum(-1).mean(0)
+    print('per-token cos (first 12):', ' '.join(f'{v:.3f}' for v in per_tok[:12]))
+    Tb = l2n(np.stack([Wp @ H[k, best[k]] + b for k in range(n)]))
+    print(f'text cos using best row: {float((Tb * Tr[:n]).sum(1).mean()):.4f}')
+    print('---- END TEXT DIAG ----')
+
+
 def metrics(ds, vdir, tdir, report, size, mode, vdt, vqs, vzp, tdt, tqs, tzp):
     ds = Path(ds)
     gt = json.loads((ds / 'gt.json').read_text())
@@ -140,6 +180,7 @@ def metrics(ds, vdir, tdir, report, size, mode, vdt, vqs, vzp, tdt, tqs, tzp):
     G, vzp = max(((vis(z), z) for z in {vzp, -vzp}), key=lambda t: float((t[0] * Gr).sum(1).mean()))
     T, tzp = max(((txt_(z), z) for z in {tzp, -tzp}), key=lambda t: float((t[0] * Tr).sum(1).mean()))
     cv, ct = (G * Gr).sum(1), (T * Tr).sum(1)
+    text_diag(ds, traw, tdt, tqs, tzp, L, off, eot, Wp, b, Tr)
     out = [f'combo=vision_{size}_text_{mode}']
     for tag, r in (('ara', evaluate(T @ G.T, ip, qp)),
                    ('ara_vision_fp32_text', evaluate(Tr @ G.T, ip, qp)),
