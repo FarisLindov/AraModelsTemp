@@ -149,6 +149,21 @@ def text_diag(ds, traw, tdt, tqs, tzp, L, off, eot, Wp, b, Tr):
     print(f'best row for fp32 eot: {best[:10].tolist()} expected {rows[:10].tolist()} best cos {float(sim.max(1).mean()):.4f}')
     per_tok = (l2n(H) * l2n(Hr)).sum(-1).mean(0)
     print('per-token cos (first 12):', ' '.join(f'{v:.3f}' for v in per_tok[:12]))
+    # Full per-row profile (mean over captions) to see where accuracy starts to fall.
+    pt = (l2n(H) * l2n(Hr)).sum(-1)
+    for s in range(0, L, 12):
+        print(f'per-row cos {s:2d}-{min(s + 12, L) - 1:2d}:', ' '.join(f'{v:.3f}' for v in pt.mean(0)[s:s + 12]))
+    # Same, aligned to each caption's EOT row: offset -8..+4 around EOT.
+    al = []
+    for d in range(-8, 5):
+        r = rows + d
+        ok = (r >= 0) & (r < L)
+        al.append(f'{d:+d}:{float(pt[idx[ok], r[ok]].mean()):.3f}' if ok.any() else f'{d:+d}:n/a')
+    print('cos vs offset from eot:', ' '.join(al))
+    # Content rows (before EOT) vs padding rows (after EOT), averaged per caption.
+    pre = np.mean([pt[k, :rows[k]].mean() for k in range(n)])
+    post = np.mean([pt[k, rows[k] + 1:].mean() if rows[k] + 1 < L else np.nan for k in range(n)])
+    print(f'cos content rows (<eot) {pre:.4f}  eot {float(pt[idx, rows].mean()):.4f}  padding rows (>eot) {np.nanmean(post):.4f}')
     Tb = l2n(np.stack([Wp @ H[k, best[k]] + b for k in range(n)]))
     print(f'text cos using best row: {float((Tb * Tr[:n]).sum(1).mean()):.4f}')
     print('---- END TEXT DIAG ----')
