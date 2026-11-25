@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"name": "RSTPReid",
+			"path": "../../ClipVIT/RSTPReid"
+		},
+		{
+			"name": "AraModelsTemp",
+			"path": "."
+		},
+		{
+			"path": "../../ClipVIT/RSTPReid-100"
+		}
+	],
+	"settings": {}
+}
